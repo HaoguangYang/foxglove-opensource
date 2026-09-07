@@ -8,6 +8,9 @@ addFoxgloveSchema(FRAME_TRANSFORM_DATATYPES, "foxglove.FrameTransform");
 export const FRAME_TRANSFORMS_DATATYPES = new Set<string>();
 addFoxgloveSchema(FRAME_TRANSFORMS_DATATYPES, "foxglove.FrameTransforms");
 
+export const JOINTSTATES_DATATYPES = new Set<string>();
+addFoxgloveSchema(JOINTSTATES_DATATYPES, "foxglove.JointStates");
+
 export const POINTCLOUD_DATATYPES = new Set<string>();
 addFoxgloveSchema(POINTCLOUD_DATATYPES, "foxglove.PointCloud");
 

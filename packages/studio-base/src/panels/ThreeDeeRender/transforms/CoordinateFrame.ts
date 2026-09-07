@@ -52,6 +52,8 @@ export class CoordinateFrame<ID extends AnyFrameId = UserFrameId> {
   #transformPool: ObjectPool<Transform>;
   #parent?: CoordinateFrame;
   #transforms: ArrayMap<Time, Transform>;
+  /** Owner IDs for transform samples that belong to a synthetic scene extension. */
+  #transformOwners = new Map<Time, string>();
 
   public constructor(
     id: ID,
@@ -120,6 +122,7 @@ export class CoordinateFrame<ID extends AnyFrameId = UserFrameId> {
   public setParent(parent: CoordinateFrame): void {
     if (this.#parent && this.#parent !== parent) {
       const removed = this.#transforms.clear();
+      this.#transformOwners.clear();
       for (const [, tf] of removed) {
         this.#transformPool.release(tf);
       }
@@ -152,10 +155,15 @@ export class CoordinateFrame<ID extends AnyFrameId = UserFrameId> {
    *
    * If a transform with an identical timestamp already exists, it is replaced.
    */
-  public addTransform(time: Time, transform: Transform): void {
+  public addTransform(time: Time, transform: Transform, owner?: string): void {
     const oldTf = this.#transforms.set(time, transform);
     if (oldTf) {
       this.#transformPool.release(oldTf);
+    }
+    if (owner) {
+      this.#transformOwners.set(time, owner);
+    } else {
+      this.#transformOwners.delete(time);
     }
 
     // Remove transforms that are too old
@@ -175,7 +183,8 @@ export class CoordinateFrame<ID extends AnyFrameId = UserFrameId> {
       removeBeforeTime = startTime > removeBeforeTime ? startTime : removeBeforeTime;
 
       const entriesRemoved = this.#transforms.removeBefore(removeBeforeTime);
-      for (const [, tf] of entriesRemoved) {
+      for (const [time, tf] of entriesRemoved) {
+        this.#transformOwners.delete(time);
         this.#transformPool.release(tf);
       }
     }
@@ -184,7 +193,8 @@ export class CoordinateFrame<ID extends AnyFrameId = UserFrameId> {
   /** Remove all transforms with timestamps greater than the given timestamp. */
   public removeTransformsAfter(time: Time): void {
     const removed = this.#transforms.removeAfter(time);
-    for (const [, tf] of removed) {
+    for (const [removedTime, tf] of removed) {
+      this.#transformOwners.delete(removedTime);
       this.#transformPool.release(tf);
     }
   }
@@ -193,8 +203,26 @@ export class CoordinateFrame<ID extends AnyFrameId = UserFrameId> {
   public removeTransformAt(time: Time): void {
     const tf = this.#transforms.remove(time);
     if (tf?.[1]) {
+      this.#transformOwners.delete(time);
       this.#transformPool.release(tf[1]);
     }
+  }
+
+  /** Removes every retained transform sample with this synthetic owner. */
+  public removeTransformsByOwner(owner: string): number {
+    let removedCount = 0;
+    for (const [time, currentOwner] of this.#transformOwners) {
+      if (currentOwner !== owner) {
+        continue;
+      }
+      const transform = this.#transforms.remove(time);
+      this.#transformOwners.delete(time);
+      if (transform?.[1]) {
+        this.#transformPool.release(transform[1]);
+        removedCount++;
+      }
+    }
+    return removedCount;
   }
 
   /**

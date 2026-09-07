@@ -1064,6 +1064,7 @@ export class Renderer extends EventEmitter<RendererEvents> implements IRenderer 
     translation: Vector3,
     rotation: Quaternion,
     errorSettingsPath?: string[],
+    owner?: string,
   ): void {
     const t = translation;
     const q = rotation;
@@ -1079,7 +1080,13 @@ export class Renderer extends EventEmitter<RendererEvents> implements IRenderer 
 
     const transform = this.#transformPool.acquire();
     transform.setPositionRotation(tempVec3, tempQuat);
-    const status = this.transformTree.addTransform(childFrameId, parentFrameId, stamp, transform);
+    const status = this.transformTree.addTransform(
+      childFrameId,
+      parentFrameId,
+      stamp,
+      transform,
+      owner,
+    );
 
     if (status === AddTransformResult.UPDATED) {
       this.coordinateFrameList = this.transformTree.frameList();
@@ -1115,6 +1122,12 @@ export class Renderer extends EventEmitter<RendererEvents> implements IRenderer 
 
   public removeTransform(childFrameId: string, parentFrameId: string, stamp: bigint): void {
     this.transformTree.removeTransform(childFrameId, parentFrameId, stamp);
+    this.coordinateFrameList = this.transformTree.frameList();
+    this.emit("transformTreeUpdated", this);
+  }
+
+  public removeTransformsByOwner(owner: string): void {
+    this.transformTree.removeTransformsByOwner(owner);
     this.coordinateFrameList = this.transformTree.frameList();
     this.emit("transformTreeUpdated", this);
   }

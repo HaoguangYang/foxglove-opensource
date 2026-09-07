@@ -365,9 +365,11 @@ export interface IRenderer extends EventEmitter<RendererEvents> {
     translation: Vector3,
     rotation: Quaternion,
     errorSettingsPath?: string[],
+    owner?: string,
   ): void;
 
   removeTransform(childFrameId: string, parentFrameId: string, stamp: bigint): void;
+  removeTransformsByOwner(owner: string): void;
 
   // Callback handlers
   animationFrame: () => void;

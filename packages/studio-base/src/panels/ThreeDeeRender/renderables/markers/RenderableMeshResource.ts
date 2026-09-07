@@ -4,7 +4,9 @@
 
 import * as THREE from "three";
 
+import type { BuiltinPanelExtensionContext } from "@foxglove/studio-base/components/PanelExtensionAdapter";
 import { EDGE_LINE_SEGMENTS_NAME } from "@foxglove/studio-base/panels/ThreeDeeRender/ModelCache";
+import type { AssetUrlResolver } from "@foxglove/studio-base/panels/ThreeDeeRender/ModelCache";
 
 import { RenderableMarker } from "./RenderableMarker";
 import { makeStandardMaterial } from "./materials";
@@ -20,6 +22,9 @@ export class RenderableMeshResource extends RenderableMarker {
   #mesh: THREE.Group | THREE.Scene | undefined;
   #material: THREE.MeshStandardMaterial;
   #referenceUrl: string | undefined;
+  #fetchAsset: BuiltinPanelExtensionContext["unstable_fetchAsset"] | undefined;
+  #resolveUrl: AssetUrlResolver | undefined;
+  #preserveCachedResources = false;
 
   /** Track updates to avoid race conditions when asynchronously loading models */
   #updateId = 0;
@@ -29,18 +34,32 @@ export class RenderableMeshResource extends RenderableMarker {
     marker: Marker,
     receiveTime: bigint | undefined,
     renderer: IRenderer,
-    options?: { referenceUrl?: string },
+    options?: {
+      referenceUrl?: string;
+      fetchAsset?: BuiltinPanelExtensionContext["unstable_fetchAsset"];
+      resolveUrl?: AssetUrlResolver;
+      /** ModelCache owns resources for portable embedded URDF packages until their final layer releases them. */
+      preserveCachedResources?: boolean;
+    },
   ) {
     super(topic, marker, receiveTime, renderer);
 
     this.#material = makeStandardMaterial(marker.color);
     this.#referenceUrl = options?.referenceUrl;
+    this.#fetchAsset = options?.fetchAsset;
+    this.#resolveUrl = options?.resolveUrl;
+    this.#preserveCachedResources = options?.preserveCachedResources ?? false;
     this.update(marker, receiveTime, true);
   }
 
   public override dispose(): void {
+    ++this.#updateId;
     if (this.#mesh) {
-      disposeMeshesRecursive(this.#mesh);
+      this.remove(this.#mesh);
+      if (!this.#preserveCachedResources) {
+        disposeMeshesRecursive(this.#mesh);
+      }
+      this.#mesh = undefined;
     }
     this.#material.dispose();
   }
@@ -72,7 +91,9 @@ export class RenderableMeshResource extends RenderableMarker {
       const errors = this.renderer.settings.errors;
       if (this.#mesh) {
         this.remove(this.#mesh);
-        disposeMeshesRecursive(this.#mesh);
+        if (!this.#preserveCachedResources) {
+          disposeMeshesRecursive(this.#mesh);
+        }
         this.#mesh = undefined;
       }
       this.#loadModel(marker.mesh_resource, opts)
@@ -82,7 +103,9 @@ export class RenderableMeshResource extends RenderableMarker {
           }
           if (this.#updateId !== curUpdateId) {
             // another update has started
-            disposeMeshesRecursive(mesh);
+            if (!this.#preserveCachedResources) {
+              disposeMeshesRecursive(mesh);
+            }
             return;
           }
           this.#mesh = mesh;
@@ -127,7 +150,11 @@ export class RenderableMeshResource extends RenderableMarker {
   ): Promise<THREE.Group | THREE.Scene | undefined> {
     const cachedModel = await this.renderer.modelCache.load(
       url,
-      { referenceUrl: this.#referenceUrl },
+      {
+        referenceUrl: this.#referenceUrl,
+        fetchAsset: this.#fetchAsset,
+        resolveUrl: this.#resolveUrl,
+      },
       (err) => {
         this.renderer.settings.errors.add(
           this.userData.settingsPath,
@@ -151,7 +178,9 @@ export class RenderableMeshResource extends RenderableMarker {
     const mesh = cachedModel.clone(true);
     removeLights(mesh);
     if (!opts.useEmbeddedMaterials) {
-      replaceMaterials(mesh, this.#material);
+      replaceMaterials(mesh, this.#material, {
+        disposeReplacedMaterials: !this.#preserveCachedResources,
+      });
     }
 
     return mesh;

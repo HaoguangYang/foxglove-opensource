@@ -26,21 +26,27 @@ export function removeLights(model: LoadedModel): void {
   }
 }
 
-export function replaceMaterials(model: LoadedModel, material: THREE.MeshStandardMaterial): void {
+export function replaceMaterials(
+  model: LoadedModel,
+  material: THREE.MeshStandardMaterial,
+  options?: { disposeReplacedMaterials?: boolean },
+): void {
   model.traverse((child: THREE.Object3D) => {
     if (!(child instanceof THREE.Mesh)) {
       return;
     }
 
-    // Dispose of any allocated textures and the material and swap it with
-    // our own material
+    // Cached models normally transfer ownership of replaced materials to this renderable. Embedded
+    // URDF packages keep that ownership in ModelCache until their final layer releases it.
     const meshChild = child as GltfMesh;
-    if (Array.isArray(meshChild.material)) {
-      for (const embeddedMaterial of meshChild.material) {
-        disposeStandardMaterial(embeddedMaterial);
+    if (options?.disposeReplacedMaterials !== false) {
+      if (Array.isArray(meshChild.material)) {
+        for (const embeddedMaterial of meshChild.material) {
+          disposeStandardMaterial(embeddedMaterial);
+        }
+      } else {
+        disposeStandardMaterial(meshChild.material);
       }
-    } else {
-      disposeStandardMaterial(meshChild.material);
     }
     meshChild.material = material;
     if (!meshChild.geometry.attributes.normal) {

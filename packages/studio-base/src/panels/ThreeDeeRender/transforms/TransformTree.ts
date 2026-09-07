@@ -78,6 +78,7 @@ export class TransformTree {
     parentFrameId: string,
     time: Time,
     transform: Transform,
+    owner?: string,
   ): AddTransformResult {
     let updated = !this.hasFrame(frameId);
     let cycleDetected = false;
@@ -94,7 +95,7 @@ export class TransformTree {
     }
 
     if (!cycleDetected) {
-      frame.addTransform(time, transform);
+      frame.addTransform(time, transform, owner);
     }
 
     return cycleDetected
@@ -118,6 +119,15 @@ export class TransformTree {
     }
     child.removeTransformAt(stamp);
     this.#removeEmptyAncestors(child);
+  }
+
+  /** Removes all retained synthetic transform samples belonging to one scene-extension owner. */
+  public removeTransformsByOwner(owner: string): void {
+    for (const frame of [...this.#frames.values()]) {
+      if (frame.removeTransformsByOwner(owner) > 0) {
+        this.#removeEmptyAncestors(frame);
+      }
+    }
   }
 
   /**

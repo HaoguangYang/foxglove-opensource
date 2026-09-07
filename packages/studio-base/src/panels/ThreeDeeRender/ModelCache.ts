@@ -15,6 +15,8 @@ import { STLLoader } from "three/examples/jsm/loaders/STLLoader";
 import Logger from "@foxglove/log";
 import { BuiltinPanelExtensionContext } from "@foxglove/studio-base/components/PanelExtensionAdapter";
 
+import { disposeMeshesRecursive } from "./dispose";
+
 const log = Logger.getLogger(__filename);
 
 export type MeshUpAxis = "y_up" | "z_up";
@@ -27,10 +29,16 @@ export type ModelCacheOptions = {
   fetchAsset: BuiltinPanelExtensionContext["unstable_fetchAsset"];
 };
 
-type LoadModelOptions = {
+export type AssetUrlResolver = (url: string) => string;
+
+export type LoadModelOptions = {
   overrideMediaType?: string;
   /** A URL to e.g. a URDf which may be used to resolve mesh package:// URLs */
   referenceUrl?: string;
+  /** Optional per-model asset fetcher for an in-memory URDF package. */
+  fetchAsset?: BuiltinPanelExtensionContext["unstable_fetchAsset"];
+  /** Rewrites secondary loader URLs (for example glTF and Collada textures). */
+  resolveUrl?: AssetUrlResolver;
 };
 
 export type LoadedModel = THREE.Group | THREE.Scene;
@@ -50,7 +58,7 @@ export class ModelCache {
   #models = new Map<string, Promise<LoadedModel | undefined>>();
   #edgeMaterial: THREE.Material;
   #fetchAsset: BuiltinPanelExtensionContext["unstable_fetchAsset"];
-  #colladaTextureObjectUrls = new Map<string, string>();
+  #colladaTextureUrls = new Map<string, { url: string; isObjectUrl: boolean }>();
   #dracoLoader?: DRACOLoader;
 
   public constructor(public readonly options: ModelCacheOptions) {
@@ -79,6 +87,31 @@ export class ModelCache {
     return await promise;
   }
 
+  /** Removes one no-longer-referenced model and releases its GPU resources after it settles. */
+  public evict(url: string): void {
+    const model = this.#models.get(url);
+    if (!model) {
+      return;
+    }
+    this.#models.delete(url);
+    const embeddedPackagePrefix = embeddedPackagePrefixForUrl(url);
+    if (embeddedPackagePrefix) {
+      for (const [textureUrl, texture] of this.#colladaTextureUrls) {
+        if (textureUrl.startsWith(embeddedPackagePrefix)) {
+          if (texture.isObjectUrl) {
+            URL.revokeObjectURL(texture.url);
+          }
+          this.#colladaTextureUrls.delete(textureUrl);
+        }
+      }
+    }
+    void model.then((loadedModel) => {
+      if (loadedModel) {
+        disposeMeshesRecursive(loadedModel);
+      }
+    });
+  }
+
   async #loadModel(
     url: string,
     options: LoadModelOptions,
@@ -86,7 +119,8 @@ export class ModelCache {
   ): Promise<LoadedModel> {
     const GLB_MAGIC = 0x676c5446; // "glTF"
 
-    const asset = await this.#fetchAsset(url, { referenceUrl: options.referenceUrl });
+    const fetchAsset = options.fetchAsset ?? this.#fetchAsset;
+    const asset = await fetchAsset(url, { referenceUrl: options.referenceUrl });
 
     const buffer = asset.data;
     if (buffer.byteLength < 4) {
@@ -102,7 +136,7 @@ export class ModelCache {
       /\.glb$/i.test(url) ||
       /\.gltf$/i.test(url)
     ) {
-      return await this.#loadGltf(url, reportError);
+      return await this.#loadGltf(url, reportError, options.resolveUrl);
     }
 
     // Check if this is a STL file based on content-type or file extension
@@ -119,7 +153,14 @@ export class ModelCache {
     // Check if this is a COLLADA file based on content-type or file extension
     if (DAE_MIME_TYPES.includes(contentType) || /\.dae$/i.test(url)) {
       const text = this.#textDecoder.decode(buffer);
-      return await this.#loadCollada(url, text, this.options.ignoreColladaUpAxis, reportError);
+      return await this.#loadCollada(
+        url,
+        text,
+        this.options.ignoreColladaUpAxis,
+        reportError,
+        fetchAsset,
+        options.resolveUrl,
+      );
     }
 
     // Check if this is an OBJ file based on content-type or file extension
@@ -131,7 +172,11 @@ export class ModelCache {
     throw new Error(`Unknown ${buffer.byteLength} byte mesh (content-type: "${contentType}")`);
   }
 
-  async #loadGltf(url: string, reportError: ErrorCallback): Promise<LoadedModel> {
+  async #loadGltf(
+    url: string,
+    reportError: ErrorCallback,
+    resolveUrl?: AssetUrlResolver,
+  ): Promise<LoadedModel> {
     const onError = (assetUrl: string) => {
       const originalUrl = unrewriteUrl(assetUrl);
       log.error(`Failed to load GLTF asset "${originalUrl}" for "${url}"`);
@@ -139,7 +184,7 @@ export class ModelCache {
     };
 
     const manager = new THREE.LoadingManager(undefined, undefined, onError);
-    manager.setURLModifier(rewriteUrl);
+    manager.setURLModifier((assetUrl) => resolveModelAssetUrl(assetUrl, resolveUrl));
     const gltfLoader = new GLTFLoader(manager);
     gltfLoader.setMeshoptDecoder(MeshoptDecoder);
     gltfLoader.setDRACOLoader(this.#getDracoLoader(manager));
@@ -186,6 +231,8 @@ export class ModelCache {
     // eslint-disable-next-line @foxglove/no-boolean-parameters
     ignoreUpAxis: boolean,
     reportError: ErrorCallback,
+    fetchAsset: BuiltinPanelExtensionContext["unstable_fetchAsset"],
+    resolveUrl?: AssetUrlResolver,
   ): Promise<LoadedModel> {
     const onError = (assetUrl: string) => {
       const originalUrl = unrewriteUrl(assetUrl);
@@ -215,14 +262,19 @@ export class ModelCache {
 
       try {
         const textureUrl = new URL(node.textContent, baseUrl(url)).toString();
-        if (this.#colladaTextureObjectUrls.has(textureUrl)) {
+        if (this.#colladaTextureUrls.has(textureUrl)) {
           continue;
         }
-        const textureAsset = await this.#fetchAsset(textureUrl);
-        const objectUrl = URL.createObjectURL(
-          new Blob([textureAsset.data], { type: textureAsset.mediaType }),
-        );
-        this.#colladaTextureObjectUrls.set(textureUrl, objectUrl);
+        if (resolveUrl) {
+          const resolvedUrl = resolveUrl(textureUrl);
+          this.#colladaTextureUrls.set(textureUrl, { url: resolvedUrl, isObjectUrl: false });
+        } else {
+          const textureAsset = await fetchAsset(textureUrl);
+          const objectUrl = URL.createObjectURL(
+            new Blob([textureAsset.data], { type: textureAsset.mediaType }),
+          );
+          this.#colladaTextureUrls.set(textureUrl, { url: objectUrl, isObjectUrl: true });
+        }
       } catch (e) {
         log.error(e);
         onError(node.textContent);
@@ -230,7 +282,11 @@ export class ModelCache {
     }
 
     const manager = new THREE.LoadingManager(undefined, undefined, onError);
-    manager.setURLModifier((u) => this.#colladaTextureObjectUrls.get(u) ?? rewriteUrl(u));
+    manager.setURLModifier(
+      (assetUrl) =>
+        this.#colladaTextureUrls.get(assetUrl)?.url ??
+        resolveModelAssetUrl(assetUrl, resolveUrl),
+    );
     const daeLoader = new ColladaLoader(manager);
 
     manager.itemStart(url);
@@ -302,13 +358,35 @@ export class ModelCache {
   }
 
   public dispose(): void {
-    this.#colladaTextureObjectUrls.forEach((_key, objectUrl) => {
-      URL.revokeObjectURL(objectUrl);
+    for (const url of [...this.#models.keys()]) {
+      this.evict(url);
+    }
+    this.#colladaTextureUrls.forEach(({ isObjectUrl, url }) => {
+      if (isObjectUrl) {
+        URL.revokeObjectURL(url);
+      }
     });
+    this.#colladaTextureUrls.clear();
     // DRACOLoader is only loader that needs to be disposed because it uses a webworker
     this.#dracoLoader?.dispose();
     this.#dracoLoader = undefined;
   }
+}
+
+/**
+ * Embedded packages supply a complete resolver. Its failures must propagate so Three.js cannot
+ * follow a missing secondary resource to a remote or unrelated URL.
+ */
+export function resolveModelAssetUrl(url: string, resolveUrl?: AssetUrlResolver): string {
+  return resolveUrl ? resolveUrl(url) : rewriteUrl(url);
+}
+
+function embeddedPackagePrefixForUrl(url: string): string | undefined {
+  if (!url.startsWith("embedded-urdf:")) {
+    return undefined;
+  }
+  const parsed = new URL(url);
+  return `${parsed.protocol}//${parsed.host}/`;
 }
 
 export const EDGE_LINE_SEGMENTS_NAME = "edges";

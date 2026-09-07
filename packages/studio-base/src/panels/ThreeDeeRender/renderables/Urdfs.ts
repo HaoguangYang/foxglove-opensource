@@ -9,19 +9,36 @@ import * as THREE from "three";
 import { v4 as uuidv4 } from "uuid";
 
 import { filterMap } from "@foxglove/den/collection";
-import { UrdfGeometryMesh, UrdfRobot, UrdfVisual, parseRobot, UrdfJoint } from "@foxglove/den/urdf";
+import { UrdfGeometryMesh, UrdfRobot, UrdfVisual, parseRobot } from "@foxglove/den/urdf";
 import Logger from "@foxglove/log";
-import { toNanoSec } from "@foxglove/rostime";
 import {
   SettingsTreeAction,
   SettingsTreeChildren,
   SettingsTreeField,
   SettingsTreeFields,
+  SettingsTreeNodeActionItem,
 } from "@foxglove/studio";
 import { makeRgba, stringToRgba } from "@foxglove/studio-base/panels/ThreeDeeRender/color";
 import { eulerToQuaternion } from "@foxglove/studio-base/util/geometry";
 import isDesktopApp from "@foxglove/studio-base/util/isDesktopApp";
 
+import {
+  createEmbeddedUrdfPackageFromFiles,
+  EmbeddedUrdfPackageResolver,
+  makeEmbeddedUrdfUrl,
+} from "./EmbeddedUrdfPackage";
+import type { EmbeddedUrdfPackage } from "./EmbeddedUrdfPackage";
+import { LocalModelUrlReferences } from "./LocalModelUrlReferences";
+import {
+  applyUrdfJointStateTransforms,
+  normalizeUrdfJointState,
+} from "./UrdfJointStateTransforms";
+import type {
+  JointPosition,
+  NormalizedJointState,
+  UrdfJointTransform,
+} from "./UrdfJointStateTransforms";
+import { UrdfLoadGeneration } from "./UrdfLoadGeneration";
 import { RenderableCube } from "./markers/RenderableCube";
 import { RenderableCylinder } from "./markers/RenderableCylinder";
 import { RenderableMeshResource } from "./markers/RenderableMeshResource";
@@ -31,9 +48,9 @@ import type { AnyRendererSubscription, IRenderer } from "../IRenderer";
 import { BaseUserData, Renderable } from "../Renderable";
 import { PartialMessageEvent, SceneExtension, onlyLastByTopicMessage } from "../SceneExtension";
 import { SettingsTreeEntry } from "../SettingsManager";
+import { JOINTSTATES_DATATYPES } from "../foxglove";
 import {
   ColorRGBA,
-  JointState,
   JOINTSTATE_DATATYPES,
   Marker,
   MarkerAction,
@@ -82,15 +99,55 @@ export type LayerSettingsUrdf = BaseSettings & {
 
 export type LayerSettingsCustomUrdf = CustomLayerSettings & {
   layerId: "foxglove.Urdf";
-  sourceType: "url" | "filePath" | "param" | "topic";
+  sourceType: "url" | "filePath" | "localFiles" | "param" | "topic";
   url?: string;
   filePath?: string;
+  /** Portable browser-imported URDF package. It contains bytes, never Files or file handles. */
+  localPackage?: EmbeddedUrdfPackage;
   parameter?: string;
   topic?: string;
+  /** Explicit JointState source used to animate this custom URDF's non-fixed links. */
+  jointStateTopic?: string;
   framePrefix: string;
   displayMode: "auto" | "visual" | "collision";
   fallbackColor?: string;
 };
+
+type LocalUrdfImportTrigger = "source-change" | "manual";
+
+export type LocalUrdfImportPlan = {
+  openPicker: boolean;
+  clearBeforePicker: boolean;
+};
+
+export function getLocalFilesUrdfSettings(
+  sourceType: LayerSettingsCustomUrdf["sourceType"],
+): { actions: SettingsTreeNodeActionItem[] } {
+  return {
+    actions:
+      sourceType === "localFiles"
+        ? [
+            {
+              type: "action",
+              id: "import-local-files",
+              label: "Choose URDF package",
+              icon: "FolderOpen",
+              display: "inline",
+            },
+          ]
+        : [],
+  };
+}
+
+export function getLocalUrdfImportPlan(
+  trigger: LocalUrdfImportTrigger,
+  settings: Pick<LayerSettingsCustomUrdf, "sourceType" | "localPackage">,
+): LocalUrdfImportPlan {
+  const needsPackage = settings.sourceType === "localFiles" && settings.localPackage == undefined;
+  return trigger === "source-change"
+    ? { openPicker: needsPackage, clearBeforePicker: needsPackage }
+    : { openPicker: true, clearBeforePicker: false };
+}
 
 const DEFAULT_SETTINGS: LayerSettingsUrdf = {
   visible: false,
@@ -112,11 +169,14 @@ const DEFAULT_CUSTOM_SETTINGS: LayerSettingsCustomUrdf = {
   filePath: "",
   parameter: "",
   topic: "",
+  jointStateTopic: "",
   framePrefix: "",
   displayMode: "auto",
   fallbackColor: DEFAULT_COLOR_STR,
 };
 const URDF_TOPIC_SCHEMAS = new Set<string>(["std_msgs/String", "std_msgs/msg/String"]);
+const JOINT_STATE_TOPIC_SCHEMAS = new Set([...JOINTSTATE_DATATYPES, ...JOINTSTATES_DATATYPES]);
+const MAX_PENDING_JOINT_STATES_PER_LAYER = 2_000;
 
 const tempVec3a = new THREE.Vector3();
 const tempVec3b = new THREE.Vector3();
@@ -138,23 +198,12 @@ enum EmbeddedMaterialUsage {
   Ignore,
 }
 
-type TransformData = {
-  parent: string;
-  child: string;
-  translation: Vector3;
-  rotation: Quaternion;
-  joint: UrdfJoint;
-};
+type TransformData = UrdfJointTransform;
 
 type ParsedUrdf = {
   robot: UrdfRobot;
   frames: string[];
   transforms: TransformData[];
-};
-
-type JointPosition = {
-  timestamp: bigint;
-  position: number;
 };
 
 export class UrdfRenderable extends Renderable<UrdfUserData> {
@@ -177,9 +226,13 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
   public static extensionId = "foxglove.Urdfs";
   #framesByInstanceId = new Map<string, string[]>();
   #transformsByInstanceId = new Map<string, TransformData[]>();
-  #jointStates = new Map<string, JointPosition>();
+  #jointStatesByInstanceId = new Map<string, Map<string, JointPosition>>();
+  #pendingJointStatesByInstanceId = new Map<string, NormalizedJointState[]>();
+  #jointStateTransformOwners = new Set<string>();
   #textDecoder = new TextDecoder();
   #urdfsByTopic = new Map<string, string>();
+  #loadGenerations = new UrdfLoadGeneration();
+  #localModelUrls = new LocalModelUrlReferences();
 
   public constructor(renderer: IRenderer, name: string = Urdfs.extensionId) {
     super(name, renderer);
@@ -200,6 +253,17 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
     }
   }
 
+  public override dispose(): void {
+    for (const instanceId of this.renderables.keys()) {
+      this.#loadGenerations.begin(instanceId);
+      this.#clearJointStateLayer(instanceId, true, false);
+    }
+    super.dispose();
+    for (const url of this.#localModelUrls.clear()) {
+      this.renderer.modelCache.evict(url);
+    }
+  }
+
   public override getSubscriptions(): readonly AnyRendererSubscription[] {
     return [
       {
@@ -211,13 +275,16 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
         },
       },
 
-      // Note that this subscription will never happen because it does not appear as a topic in the
-      // topic list that can have its visibility toggled on. The ThreeDeeRender subscription logic
-      // needs to become more flexible to make this possible
       {
         type: "schema",
-        schemaNames: JOINTSTATE_DATATYPES,
-        subscription: { handler: this.#handleJointState, filterQueue: onlyLastByTopicMessage },
+        schemaNames: JOINT_STATE_TOPIC_SCHEMAS,
+        subscription: {
+          // Joint states are transform history. Keeping every queued message and preloading lets
+          // replay reconstruct link poses at the selected playback time instead of only the latest.
+          shouldSubscribe: this.#shouldSubscribeJointState,
+          handler: this.#handleJointState,
+          preload: true,
+        },
       },
 
       {
@@ -283,7 +350,7 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
           children: urdfChildren(
             this.#transformsByInstanceId.get(TOPIC_NAME),
             this.renderer.transformTree,
-            this.#jointStates,
+            this.#jointStatesByInstanceId.get(TOPIC_NAME),
           ),
         },
       });
@@ -316,7 +383,7 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
           children: urdfChildren(
             this.#transformsByInstanceId.get(PARAM_KEY),
             this.renderer.transformTree,
-            this.#jointStates,
+            this.#jointStatesByInstanceId.get(PARAM_KEY),
           ),
         },
       });
@@ -341,6 +408,10 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
                 label: "File path (Desktop only)",
                 value: "filePath",
                 disabled: !isDesktopApp(),
+              },
+              {
+                label: "Local files (Browser)",
+                value: "localFiles",
               },
               {
                 label: "Parameter",
@@ -372,6 +443,16 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
                   disabled: !isDesktopApp(),
                 }
               : undefined,
+          localPackage:
+            config.sourceType === "localFiles"
+              ? {
+                  label: "Imported package",
+                  input: "string",
+                  value: config.localPackage?.packageName ?? "No package selected",
+                  help: "Choose a directory package to embed its URDF and assets in this layout",
+                  readonly: true,
+                }
+              : undefined,
           topic:
             config.sourceType === "topic"
               ? {
@@ -383,6 +464,15 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
                   ),
                 }
               : undefined,
+          jointStateTopic: {
+            label: "Joint state topic",
+            input: "autocomplete",
+            help: "Explicitly animates this URDF's non-fixed link frames. Leave empty when external TF drives those frames; do not use both sources for the same links.",
+            value: config.jointStateTopic ?? DEFAULT_CUSTOM_SETTINGS.jointStateTopic,
+            items: filterMap(this.renderer.topics ?? [], (_topic) =>
+              JOINT_STATE_TOPIC_SCHEMAS.has(_topic.schemaName) ? _topic.name : undefined,
+            ),
+          },
           parameter:
             config.sourceType === "param"
               ? {
@@ -424,6 +514,9 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
             fields,
             visible: config.visible ?? DEFAULT_CUSTOM_SETTINGS.visible,
             actions: [
+              ...getLocalFilesUrdfSettings(
+                config.sourceType ?? DEFAULT_CUSTOM_SETTINGS.sourceType,
+              ).actions,
               { type: "action", id: "duplicate", label: "Duplicate" },
               { type: "action", id: "delete", label: "Delete" },
             ],
@@ -432,7 +525,7 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
             children: urdfChildren(
               this.#transformsByInstanceId.get(instanceId),
               this.renderer.transformTree,
-              this.#jointStates,
+              this.#jointStatesByInstanceId.get(instanceId),
             ),
           },
         });
@@ -443,6 +536,12 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
   }
 
   public override removeAllRenderables(): void {
+    // The transform tree is cleared on seek. Keeping a future joint value here would cause
+    // #refreshTransforms to resurrect it at an earlier playback time.
+    this.#jointStatesByInstanceId.clear();
+    this.#pendingJointStatesByInstanceId.clear();
+    // Renderer only clears the TransformTree on backward seek. Keep owner records here because
+    // forward seek/clear still retains synthetic samples that later source/topic changes must remove.
     // Re-add coordinate frames and transforms since the scene has been cleared
     this.#refreshTransforms();
   }
@@ -515,6 +614,8 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
     if (action.action === "perform-node-action" && path.length === 2) {
       const instanceId = path[1]!;
       if (action.payload.id === "delete") {
+        this.#beginLoad(instanceId);
+        this.#clearJointStateLayer(instanceId, true, false);
         // Remove this instance from the config
         this.renderer.updateConfig((draft) => {
           delete draft.layers[instanceId];
@@ -527,6 +628,7 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
           this.remove(renderable);
           this.renderables.delete(instanceId);
         }
+        this.#releaseLocalModels(instanceId);
 
         // Remove transforms from the TF tree
         const transforms = this.#transformsByInstanceId.get(instanceId);
@@ -537,6 +639,7 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
         }
         this.#framesByInstanceId.delete(instanceId);
         this.#transformsByInstanceId.delete(instanceId);
+        this.#jointStatesByInstanceId.delete(instanceId);
 
         // Re-add coordinate frames in case the deleted URDF shared frame names with other URDFs
         this.#refreshTransforms();
@@ -544,6 +647,17 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
         // Update the settings tree
         this.updateSettingsTree();
         this.renderer.updateCustomLayersCount();
+      } else if (action.payload.id === "import-local-files") {
+        const settings = this.renderer.config.layers[instanceId] as
+          | Partial<LayerSettingsCustomUrdf>
+          | undefined;
+        void this.#importLocalUrdfPackage(
+          instanceId,
+          getLocalUrdfImportPlan("manual", {
+            sourceType: settings?.sourceType ?? DEFAULT_CUSTOM_SETTINGS.sourceType,
+            localPackage: settings?.localPackage,
+          }),
+        );
       } else if (action.payload.id === "duplicate") {
         const newInstanceId = uuidv4();
         const config = {
@@ -568,6 +682,58 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
       this.#handleSettingsUpdate(action);
     }
   };
+
+  async #importLocalUrdfPackage(instanceId: string, plan: LocalUrdfImportPlan): Promise<void> {
+    const settingsPath = ["layers", instanceId];
+    const generation = this.#beginLoad(instanceId);
+    if (plan.clearBeforePicker) {
+      this.#loadUrdf({ instanceId, urdf: undefined, forceReload: true, generation });
+    }
+    try {
+      const selected = await selectLocalUrdfPackageFiles();
+      if (!selected || !this.#loadGenerations.isCurrent(instanceId, generation)) {
+        return;
+      }
+      const urdfPaths = selected.files
+        .map(({ path }) => path)
+        .filter((path) => /\.(urdf|xacro)$/iu.test(path));
+      if (urdfPaths.length !== 1) {
+        throw new Error(
+          `Expected exactly one .urdf or .xacro file in the selected directory, found ${urdfPaths.length}`,
+        );
+      }
+
+      const localPackage = await createEmbeddedUrdfPackageFromFiles({
+        id: uuidv4(),
+        packageName: selected.packageName,
+        urdfPath: urdfPaths[0]!,
+        files: selected.files,
+      });
+      if (!this.#loadGenerations.isCurrent(instanceId, generation)) {
+        return;
+      }
+      this.renderer.updateConfig((draft) => {
+        const layer = draft.layers[instanceId] as Partial<LayerSettingsCustomUrdf> | undefined;
+        if (layer) {
+          layer.sourceType = "localFiles";
+          layer.localPackage = localPackage;
+        }
+      });
+      this.renderer.settings.errors.remove(settingsPath, VALID_SRC_ERR);
+      this.#loadUrdf({ instanceId, urdf: undefined, forceReload: true, generation });
+      this.updateSettingsTree();
+    } catch (error) {
+      if (!this.#loadGenerations.isCurrent(instanceId, generation)) {
+        return;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      this.renderer.settings.errors.add(
+        settingsPath,
+        VALID_SRC_ERR,
+        `Failed to import local URDF package: ${message}`,
+      );
+    }
+  }
 
   #handleSettingsUpdate = (action: { action: "update" } & SettingsTreeAction): void => {
     const path = action.payload.path;
@@ -606,8 +772,22 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
       }
     } else if (path.length === 3) {
       // ["layers", instanceId, field]
-      this.saveSetting(path, action.payload.value);
       const [_layers, instanceId, field] = path as [string, string, string];
+      if (
+        field === "url" ||
+        field === "filePath" ||
+        field === "sourceType" ||
+        field === "topic" ||
+        field === "parameter" ||
+        field === "framePrefix" ||
+        field === "jointStateTopic"
+      ) {
+        this.#clearJointStateLayer(instanceId, true, true);
+      }
+      if (field === "url" || field === "filePath" || field === "sourceType") {
+        this.#beginLoad(instanceId);
+      }
+      this.saveSetting(path, action.payload.value);
       const renderable = this.renderables.get(instanceId);
       let urdf = renderable?.userData.urdf;
 
@@ -622,6 +802,17 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
         this.#loadUrdf({ instanceId, urdf, forceReload: true });
       } else if (field === "sourceType") {
         const sourceType = action.payload.value as LayerSettingsCustomUrdf["sourceType"];
+        const settings = this.renderer.config.layers[instanceId] as
+          | Partial<LayerSettingsCustomUrdf>
+          | undefined;
+        const importPlan = getLocalUrdfImportPlan("source-change", {
+          sourceType,
+          localPackage: settings?.localPackage,
+        });
+        if (importPlan.openPicker) {
+          void this.#importLocalUrdfPackage(instanceId, importPlan);
+          return;
+        }
         if (sourceType === "topic") {
           urdf = renderable?.userData.topic
             ? this.#urdfsByTopic.get(renderable.userData.topic)
@@ -673,22 +864,120 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
     );
   };
 
-  #handleJointState = (messageEvent: PartialMessageEvent<JointState>): void => {
-    const msg = messageEvent.message;
-    const names = msg.name ?? [];
-    const positions = msg.position ?? [];
-    const timestamp = toNanoSec(messageEvent.receiveTime);
+  #shouldSubscribeJointState = (topic: string): boolean => {
+    return Object.values(this.renderer.config.layers).some(
+      (layer) =>
+        layer?.layerId === LAYER_ID &&
+        (layer as Partial<LayerSettingsCustomUrdf>).jointStateTopic === topic,
+    );
+  };
 
-    for (let i = 0; i < names.length; i++) {
-      const name = names[i]!;
-      const position = positions[i] ?? 0;
+  #handleJointState = (messageEvent: PartialMessageEvent<unknown>): void => {
+    const jointState = normalizeUrdfJointState(messageEvent.message, messageEvent.receiveTime);
+    if (jointState.positions.size === 0) {
+      return;
+    }
 
-      const prevTimestamp = this.#jointStates.get(name)?.timestamp;
-      if (prevTimestamp == undefined || timestamp >= prevTimestamp) {
-        this.#jointStates.set(name, { timestamp, position });
+    for (const [instanceId, layer] of Object.entries(this.renderer.config.layers)) {
+      if (
+        layer?.layerId !== LAYER_ID ||
+        (layer as Partial<LayerSettingsCustomUrdf>).jointStateTopic !== messageEvent.topic
+      ) {
+        continue;
+      }
+      const transforms = this.#transformsByInstanceId.get(instanceId);
+      if (transforms == undefined) {
+        this.#queuePendingJointState(instanceId, jointState);
+      } else {
+        this.#applyJointState(instanceId, transforms, jointState);
       }
     }
   };
+
+  #queuePendingJointState(instanceId: string, jointState: NormalizedJointState): void {
+    const pending = this.#pendingJointStatesByInstanceId.get(instanceId) ?? [];
+    if (pending.length === MAX_PENDING_JOINT_STATES_PER_LAYER) {
+      pending.shift();
+    }
+    pending.push(jointState);
+    this.#pendingJointStatesByInstanceId.set(instanceId, pending);
+  }
+
+  #replayPendingJointStates(instanceId: string, transforms: TransformData[]): void {
+    const pending = this.#pendingJointStatesByInstanceId.get(instanceId);
+    this.#pendingJointStatesByInstanceId.delete(instanceId);
+    for (const jointState of pending ?? []) {
+      this.#applyJointState(instanceId, transforms, jointState);
+    }
+  }
+
+  #applyJointState(
+    instanceId: string,
+    transforms: TransformData[],
+    jointState: NormalizedJointState,
+  ): void {
+    const latestPositions =
+      this.#jointStatesByInstanceId.get(instanceId) ?? new Map<string, JointPosition>();
+    this.#jointStatesByInstanceId.set(instanceId, latestPositions);
+    for (const [name, position] of jointState.positions) {
+      const previous = latestPositions.get(name);
+      if (previous == undefined || jointState.timestamp >= previous.timestamp) {
+        latestPositions.set(name, { timestamp: jointState.timestamp, position });
+      }
+    }
+
+    const addedCount = applyUrdfJointStateTransforms(
+      transforms,
+      jointState,
+      (parent, child, timestamp, translation, rotation) => {
+        this.renderer.addTransform(
+          parent,
+          child,
+          timestamp,
+          translation,
+          rotation,
+          ["layers", instanceId],
+          this.#jointStateTransformOwner(instanceId),
+        );
+      },
+    );
+    if (addedCount > 0) {
+      this.#jointStateTransformOwners.add(instanceId);
+    }
+  }
+
+  #jointStateTransformOwner(instanceId: string): string {
+    return `${this.extensionId}:${instanceId}`;
+  }
+
+  #clearJointStateLayer(
+    instanceId: string,
+    clearPending: boolean,
+    restoreStaticTransforms: boolean,
+  ): void {
+    if (this.#jointStateTransformOwners.delete(instanceId)) {
+      this.renderer.removeTransformsByOwner(this.#jointStateTransformOwner(instanceId));
+      if (restoreStaticTransforms) {
+        this.#restoreStaticTransforms(instanceId);
+      }
+    }
+    this.#jointStatesByInstanceId.delete(instanceId);
+    if (clearPending) {
+      this.#pendingJointStatesByInstanceId.delete(instanceId);
+    }
+  }
+
+  #restoreStaticTransforms(instanceId: string): void {
+    const transforms = this.#transformsByInstanceId.get(instanceId);
+    if (!transforms) {
+      return;
+    }
+    const isTopicOrParam = instanceId === TOPIC_NAME || instanceId === PARAM_KEY;
+    const settingsPath = isTopicOrParam ? ["topics", instanceId] : ["layers", instanceId];
+    for (const { parent, child, translation, rotation } of transforms) {
+      this.renderer.addTransform(parent, child, 0n, translation, rotation, settingsPath);
+    }
+  }
 
   #handleParametersChange = (parameters: ReadonlyMap<string, unknown> | undefined): void => {
     const robotDescription = parameters?.get(PARAM_NAME);
@@ -730,10 +1019,38 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
     this.updateSettingsTree();
   };
 
-  #fetchUrdf(instanceId: string, url: string): void {
+  #beginLoad(instanceId: string): number {
+    const generation = this.#loadGenerations.begin(instanceId);
+    const pendingFetch = this.renderables.get(instanceId)?.userData.fetching;
+    if (pendingFetch) {
+      pendingFetch.control.abort();
+      const renderable = this.renderables.get(instanceId);
+      if (renderable) {
+        renderable.userData.fetching = undefined;
+      }
+    }
+    return generation;
+  }
+
+  #replaceLocalModels(instanceId: string, urls: Iterable<string>): void {
+    for (const url of this.#localModelUrls.replace(instanceId, urls)) {
+      this.renderer.modelCache.evict(url);
+    }
+  }
+
+  #releaseLocalModels(instanceId: string): void {
+    for (const url of this.#localModelUrls.release(instanceId)) {
+      this.renderer.modelCache.evict(url);
+    }
+  }
+
+  #fetchUrdf(instanceId: string, url: string, generation: number): void {
     const renderable = this.renderables.get(instanceId);
     if (!renderable) {
       throw new Error(`_fetchUrdf() should only be called for existing renderables`);
+    }
+    if (!this.#loadGenerations.isCurrent(instanceId, generation)) {
+      return;
     }
 
     // Check if a valid URL was provided
@@ -744,26 +1061,33 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
     }
     this.renderer.settings.errors.remove(renderable.userData.settingsPath, VALID_SRC_ERR);
 
-    if (renderable.userData.fetching) {
-      // Check if this fetch is already in progress
-      if (renderable.userData.fetching.url === url) {
-        return;
-      }
-
-      // Cancel the previous fetch
-      renderable.userData.fetching.control.abort();
-    }
-
     log.debug(`Fetching URDF from ${url}`);
-    renderable.userData.fetching = { url, control: new AbortController() };
+    const control = new AbortController();
+    renderable.userData.fetching = { url, control };
     this.renderer
-      .fetchAsset(url, { signal: renderable.userData.fetching.control.signal })
+      .fetchAsset(url, { signal: control.signal })
       .then((urdf) => {
+        if (
+          !this.#loadGenerations.isCurrent(instanceId, generation) ||
+          renderable.userData.fetching?.control !== control
+        ) {
+          return;
+        }
         log.debug(`Fetched ${urdf.data.length} byte URDF from ${url}`);
         this.renderer.settings.errors.remove(["layers", instanceId], FETCH_URDF_ERR);
-        this.#loadUrdf({ instanceId, urdf: this.#textDecoder.decode(urdf.data) });
+        this.#loadUrdf({
+          instanceId,
+          urdf: this.#textDecoder.decode(urdf.data),
+          generation,
+        });
       })
       .catch((unknown) => {
+        if (
+          !this.#loadGenerations.isCurrent(instanceId, generation) ||
+          renderable.userData.fetching?.control !== control
+        ) {
+          return;
+        }
         const err = unknown as Error;
         const hasError = !err.message.startsWith("Failed to fetch");
         const errMessage = `Failed to load URDF from "${url}"${hasError ? `: ${err.message}` : ""}`;
@@ -781,15 +1105,55 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
     return settings;
   }
 
-  #loadUrdf(args: { instanceId: string; urdf?: string; forceReload?: boolean }): void {
-    const { instanceId, urdf } = args;
+  #loadUrdf(args: {
+    instanceId: string;
+    urdf?: string;
+    forceReload?: boolean;
+    generation?: number;
+  }): void {
+    const { instanceId } = args;
+    const generation = args.generation ?? this.#beginLoad(instanceId);
+    if (!this.#loadGenerations.isCurrent(instanceId, generation)) {
+      return;
+    }
+    let urdf = args.urdf;
     const forceReload = args.forceReload ?? false;
     let renderable = this.renderables.get(instanceId);
     const settings = this.#getCurrentSettings(instanceId);
+    const sourceType = (settings as Partial<LayerSettingsCustomUrdf>).sourceType;
+    const localPackage = (settings as Partial<LayerSettingsCustomUrdf>).localPackage;
+    let embeddedPackage: EmbeddedUrdfPackageResolver | undefined;
+    if (sourceType === "localFiles" && localPackage) {
+      try {
+        embeddedPackage = new EmbeddedUrdfPackageResolver(localPackage);
+        urdf ??= embeddedPackage.urdfText();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.renderer.settings.errors.add(
+          ["layers", instanceId],
+          VALID_SRC_ERR,
+          `Invalid local URDF package: ${message}`,
+        );
+      }
+    }
+    // Reserve every package asset before parsing. A duplicate layer can still be parsing when
+    // the original is deleted, and Three.js clones share geometry and materials with the cache.
+    this.#replaceLocalModels(
+      instanceId,
+      embeddedPackage
+        ? Object.keys(embeddedPackage.source.files).map((path) =>
+            makeEmbeddedUrdfUrl(embeddedPackage!.source, path),
+          )
+        : [],
+    );
     if (renderable && urdf && !forceReload && renderable.userData.urdf === urdf) {
       renderable.userData.settings = settings;
       return;
     }
+
+    // A reparsed/deleted source must never retain this layer's old timestamped FK samples. Keep
+    // pre-parse pending JointStates so a selected topic that arrived before this parse can replay.
+    this.#clearJointStateLayer(instanceId, false, false);
 
     // Clear any previous parsed data for this instanceId
     const transforms = this.#transformsByInstanceId.get(instanceId) ?? [];
@@ -803,7 +1167,6 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
     const isTopicOrParam = instanceId === TOPIC_NAME || instanceId === PARAM_KEY;
     const frameId = this.renderer.fixedFrameId ?? ""; // Unused
     const settingsPath = isTopicOrParam ? ["topics", instanceId] : ["layers", instanceId];
-    const sourceType = (settings as Partial<LayerSettingsCustomUrdf>).sourceType;
     const url = (settings as Partial<LayerSettingsCustomUrdf>).url;
     const filePath = (settings as Partial<LayerSettingsCustomUrdf>).filePath;
     const parameter = (settings as Partial<LayerSettingsCustomUrdf>).parameter;
@@ -859,17 +1222,23 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
       this.renderer.settings.errors.remove(path, MISSING_TRANSFORM);
       if (sourceType === "url") {
         if (url != undefined) {
-          this.#fetchUrdf(instanceId, url);
+          this.#fetchUrdf(instanceId, url, generation);
         } else {
           this.renderer.settings.errors.add(path, VALID_SRC_ERR, `Invalid URDF URL: "${url}"`);
         }
       } else if (sourceType === "filePath") {
         if (filePath != undefined) {
-          this.#fetchUrdf(instanceId, `file://${filePath}`);
+          this.#fetchUrdf(instanceId, `file://${filePath}`, generation);
         } else {
           const errMsg = `Invalid File Path: "${filePath}"`;
           this.renderer.settings.errors.add(path, VALID_SRC_ERR, errMsg);
         }
+      } else if (sourceType === "localFiles") {
+        this.renderer.settings.errors.add(
+          path,
+          VALID_SRC_ERR,
+          "Choose a directory package containing exactly one .urdf file",
+        );
       } else if (sourceType === "param") {
         this.renderer.settings.errors.add(path, VALID_SRC_ERR, `Invalid Parameter: "${parameter}"`);
       } else if (sourceType === "topic") {
@@ -885,13 +1254,25 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
       baseUrl = url;
     } else if (sourceType === "filePath") {
       baseUrl = `file://${filePath}`;
+    } else if (embeddedPackage) {
+      baseUrl = embeddedPackage.urdfUrl();
     }
 
     // Parse the URDF
     const loadedRenderable = renderable;
-    parseUrdf(urdf, async (uri) => await this.#getFileFetch(uri, baseUrl), framePrefix)
+    parseUrdf(
+      urdf,
+      async (uri) =>
+        embeddedPackage
+          ? await this.#getEmbeddedPackageFile(embeddedPackage, uri)
+          : await this.#getFileFetch(uri, baseUrl),
+      framePrefix,
+    )
       .then((parsed) => {
-        this.#loadRobot(loadedRenderable, parsed, baseUrl);
+        if (!this.#loadGenerations.isCurrent(instanceId, generation)) {
+          return;
+        }
+        this.#loadRobot(loadedRenderable, parsed, baseUrl, embeddedPackage);
         this.renderer.settings.errors.remove(
           loadedRenderable.userData.settingsPath,
           PARSE_URDF_ERR,
@@ -901,6 +1282,9 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
         this.renderer.queueAnimationFrame();
       })
       .catch((unknown) => {
+        if (!this.#loadGenerations.isCurrent(instanceId, generation)) {
+          return;
+        }
         const err = unknown as Error;
         log.error(`Failed to parse URDF: ${err.message}`);
         this.renderer.settings.errors.add(
@@ -917,6 +1301,7 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
     renderable: UrdfRenderable,
     { robot, frames, transforms }: ParsedUrdf,
     baseUrl: string | undefined,
+    embeddedPackage?: EmbeddedUrdfPackageResolver,
   ): void {
     const renderer = this.renderer;
     const settings = renderable.userData.settings;
@@ -930,7 +1315,8 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
     this.#loadTransforms(instanceId, transforms);
     this.updateSettingsTree();
 
-    // Dispose any existing renderables
+    // Dispose any existing renderables. The cache reservation was updated before parsing so a
+    // duplicated or asynchronously loading layer keeps shared model resources alive.
     renderable.removeChildren();
 
     const createChild = (frameId: string, i: number, visual: UrdfVisual): void => {
@@ -941,6 +1327,7 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
         frameId,
         renderer,
         baseUrl,
+        embeddedPackage,
         fallbackColor,
       });
       // Set the childRenderable settingsPath so errors route to the correct place
@@ -988,6 +1375,7 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
     for (const { parent, child, translation, rotation } of transforms) {
       this.renderer.addTransform(parent, child, 0n, translation, rotation, settingsPath);
     }
+    this.#replayPendingJointStates(instanceId, transforms);
   }
 
   async #getFileFetch(url: string, referenceUrl?: string): Promise<string> {
@@ -999,6 +1387,103 @@ export class Urdfs extends SceneExtension<UrdfRenderable> {
       throw new Error(`Failed to fetch "${url}": ${err}`);
     }
   }
+
+  async #getEmbeddedPackageFile(
+    embeddedPackage: EmbeddedUrdfPackageResolver,
+    url: string,
+  ): Promise<string> {
+    try {
+      const asset = await embeddedPackage.fetchAsset(url, { referenceUrl: embeddedPackage.urdfUrl() });
+      return this.#textDecoder.decode(asset.data);
+    } catch (error) {
+      throw new Error(`Failed to load "${url}" from the local URDF package: ${error}`);
+    }
+  }
+}
+
+type LocalUrdfPackageSelection = {
+  packageName: string;
+  files: Array<{ path: string; file: File }>;
+};
+
+async function selectLocalUrdfPackageFiles(): Promise<LocalUrdfPackageSelection | undefined> {
+  if (typeof showDirectoryPicker === "function") {
+    try {
+      const directory = await showDirectoryPicker();
+      return {
+        packageName: directory.name,
+        files: await collectDirectoryFiles(directory),
+      };
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        return undefined;
+      }
+      throw error;
+    }
+  }
+  return await selectDirectoryFilesWithInput();
+}
+
+async function collectDirectoryFiles(
+  directory: FileSystemDirectoryHandle,
+  prefix = "",
+): Promise<Array<{ path: string; file: File }>> {
+  const files: Array<{ path: string; file: File }> = [];
+  for await (const [name, entry] of directory.entries()) {
+    const path = `${prefix}${name}`;
+    if (entry.kind === "file") {
+      files.push({ path, file: await entry.getFile() });
+    } else {
+      files.push(...(await collectDirectoryFiles(entry, `${path}/`)));
+    }
+  }
+  return files;
+}
+
+async function selectDirectoryFilesWithInput(): Promise<LocalUrdfPackageSelection | undefined> {
+  return await new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.multiple = true;
+    input.setAttribute("webkitdirectory", "");
+    input.style.display = "none";
+    document.body.append(input);
+
+    const finish = (result: LocalUrdfPackageSelection | undefined) => {
+      input.remove();
+      resolve(result);
+    };
+    input.addEventListener(
+      "change",
+      () => {
+        const selectedFiles = Array.from(input.files ?? []);
+        if (selectedFiles.length === 0) {
+          finish(undefined);
+          return;
+        }
+        const relativePaths = selectedFiles.map((file) => file.webkitRelativePath || file.name);
+        const packageName = relativePaths[0]!.split("/")[0]!;
+        const files = selectedFiles.map((file, index) => {
+          const relativePath = relativePaths[index]!;
+          const firstSlash = relativePath.indexOf("/");
+          return {
+            path: firstSlash === -1 ? relativePath : relativePath.slice(firstSlash + 1),
+            file,
+          };
+        });
+        finish({ packageName, files });
+      },
+      { once: true },
+    );
+    input.addEventListener(
+      "cancel",
+      () => {
+        finish(undefined);
+      },
+      { once: true },
+    );
+    input.click();
+  });
 }
 
 async function parseUrdf(
@@ -1057,9 +1542,10 @@ function createRenderable(args: {
   frameId: string;
   renderer: IRenderer;
   baseUrl?: string;
+  embeddedPackage?: EmbeddedUrdfPackageResolver;
   fallbackColor?: ColorRGBA;
 }): Renderable {
-  const { visual, robot, id, frameId, renderer, baseUrl, fallbackColor } = args;
+  const { visual, robot, id, frameId, renderer, baseUrl, embeddedPackage, fallbackColor } = args;
   const name = `${frameId}-${id}-${visual.geometry.geometryType}`;
   const orientation = eulerToQuaternion(visual.origin.rpy);
   const pose = { position: visual.origin.xyz, orientation };
@@ -1087,9 +1573,20 @@ function createRenderable(args: {
       const isCollada = visual.geometry.filename.toLowerCase().endsWith(".dae");
       // Use embedded materials if the mesh is a Collada file
       const embedded = isCollada ? EmbeddedMaterialUsage.Use : EmbeddedMaterialUsage.Ignore;
-      const marker = createMeshMarker(frameId, pose, embedded, visual.geometry, baseUrl, color);
+      const marker = createMeshMarker(
+        frameId,
+        pose,
+        embedded,
+        visual.geometry,
+        baseUrl,
+        color,
+        embeddedPackage,
+      );
       return new RenderableMeshResource(name, marker, undefined, renderer, {
         referenceUrl: baseUrl,
+        fetchAsset: embeddedPackage?.fetchAsset,
+        resolveUrl: embeddedPackage?.resolveToDataUrl,
+        preserveCachedResources: embeddedPackage != undefined,
       });
     }
     default:
@@ -1143,8 +1640,15 @@ function createMeshMarker(
   mesh: UrdfGeometryMesh,
   baseUrl: string | undefined,
   color: ColorRGBA,
+  embeddedPackage?: EmbeddedUrdfPackageResolver,
 ): Marker {
   const scale = mesh.scale ?? VEC3_ONE;
+  const meshResource = embeddedPackage
+    ? embeddedPackage.resolve(mesh.filename, embeddedPackage.source.urdfPath)?.url
+    : new URL(mesh.filename, baseUrl).toString();
+  if (!meshResource) {
+    throw new Error(`Local URDF package does not contain mesh "${mesh.filename}"`);
+  }
   return {
     header: { frame_id: frameId, stamp: { sec: 0, nsec: 0 } },
     ns: "",
@@ -1159,7 +1663,7 @@ function createMeshMarker(
     points: [],
     colors: [],
     text: "",
-    mesh_resource: new URL(mesh.filename, baseUrl).toString(),
+    mesh_resource: meshResource,
     mesh_use_embedded_materials: embeddedMaterialUsage === EmbeddedMaterialUsage.Use,
   };
 }
@@ -1178,7 +1682,7 @@ function isValidUrl(str: string): boolean {
 function urdfChildren(
   transforms: TransformData[] | undefined,
   transformTree: TransformTree,
-  jointStates: Map<string, JointPosition>,
+  jointStates: ReadonlyMap<string, JointPosition> | undefined,
 ): SettingsTreeChildren {
   if (!transforms) {
     return {};
@@ -1208,7 +1712,7 @@ function urdfChildren(
         const min = joint.limit ? joint.limit.lower * RAD2DEG : -180;
         const max = joint.limit ? joint.limit.upper * RAD2DEG : 180;
         let manualDegrees: number | undefined;
-        const jointStateRadians = jointStates.get(joint.name)?.position;
+        const jointStateRadians = jointStates?.get(joint.name)?.position;
 
         if (frame.offsetEulerDegrees) {
           // Convert the Euler degrees to a quaternion
@@ -1246,7 +1750,7 @@ function urdfChildren(
         const manualPosition = frame.offsetPosition
           ? signedDistanceAlongAxis(frame.offsetPosition, joint.axis)
           : undefined;
-        const jointStatePosition = jointStates.get(joint.name)?.position;
+        const jointStatePosition = jointStates?.get(joint.name)?.position;
 
         fields.manual = {
           label: "Manual position",
