@@ -2,12 +2,16 @@
 // License, v2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/
 
-import assert from "assert";
-import { useEffect } from "react";
+import { createStore as idbCreateStore, get as idbGet, set as idbSet } from "idb-keyval";
+import * as _ from "lodash-es";
+import { useEffect, useRef, useState } from "react";
 import { useDebounce } from "use-debounce";
 
 import Log from "@foxglove/log";
-import { LOCAL_STORAGE_STUDIO_LAYOUT_KEY } from "@foxglove/studio-base/constants/localStorageKeys";
+import {
+  LOCAL_STORAGE_STUDIO_LAYOUT_IDB_FALLBACK_KEY,
+  LOCAL_STORAGE_STUDIO_LAYOUT_KEY,
+} from "@foxglove/studio-base/constants/localStorageKeys";
 import {
   LayoutState,
   useCurrentLayoutActions,
@@ -24,45 +28,194 @@ function selectLayoutData(state: LayoutState) {
 
 const log = Log.getLogger(__filename);
 
+const IDB_LAYOUT_STORE = idbCreateStore("foxglove-studio-layouts", "layouts");
+const IDB_FALLBACK_JOURNAL_VERSION = 1;
+
+type FallbackJournal = {
+  version: typeof IDB_FALLBACK_JOURNAL_VERSION;
+  layout: LayoutData;
+};
+
+function readLegacyLayout(): LayoutData | undefined {
+  try {
+    const serializedLayoutData = localStorage.getItem(LOCAL_STORAGE_STUDIO_LAYOUT_KEY);
+    if (!serializedLayoutData) {
+      return undefined;
+    }
+    return migratePanelsState(JSON.parse(serializedLayoutData) as LayoutData);
+  } catch (error) {
+    log.error(`Failed to read legacy layout from local storage`, error);
+    return undefined;
+  }
+}
+
+function readFallbackJournal(): LayoutData | undefined {
+  try {
+    const serializedJournal = localStorage.getItem(LOCAL_STORAGE_STUDIO_LAYOUT_IDB_FALLBACK_KEY);
+    if (!serializedJournal) {
+      return undefined;
+    }
+    const journal = JSON.parse(serializedJournal) as Partial<FallbackJournal>;
+    if (journal.version !== IDB_FALLBACK_JOURNAL_VERSION || !journal.layout) {
+      throw new Error("Invalid IndexedDB fallback journal");
+    }
+    return migratePanelsState(journal.layout);
+  } catch (error) {
+    log.error(`Failed to read IndexedDB fallback journal`, error);
+    return undefined;
+  }
+}
+
+function writeFallbackJournal(layoutData: LayoutData): boolean {
+  try {
+    const serializedJournal = JSON.stringify({
+      version: IDB_FALLBACK_JOURNAL_VERSION,
+      layout: layoutData,
+    } satisfies FallbackJournal);
+    if (!serializedJournal) {
+      throw new Error("Layout data could not be serialized");
+    }
+    localStorage.setItem(LOCAL_STORAGE_STUDIO_LAYOUT_IDB_FALLBACK_KEY, serializedJournal);
+    return true;
+  } catch (error) {
+    log.error(`Failed to persist IndexedDB fallback journal`, error);
+    return false;
+  }
+}
+
+function clearFallbackJournal(): void {
+  try {
+    localStorage.removeItem(LOCAL_STORAGE_STUDIO_LAYOUT_IDB_FALLBACK_KEY);
+  } catch (error) {
+    log.error(`Failed to clear IndexedDB fallback journal`, error);
+  }
+}
+
+function hasSampleLayout(sampleLayoutRef: { current: LayoutData | undefined }): boolean {
+  return sampleLayoutRef.current != undefined;
+}
+
 export function CurrentLayoutLocalStorageSyncAdapter(): JSX.Element {
   const { selectedSource } = usePlayerSelection();
 
   const { setCurrentLayout } = useCurrentLayoutActions();
   const currentLayoutData = useCurrentLayoutSelector(selectLayoutData);
+  const [hydrated, setHydrated] = useState(false);
+  const persistedLayoutRef = useRef<LayoutData | undefined>();
+  const restoreTokenRef = useRef<symbol | undefined>();
+  const layoutFromFailedReadRef = useRef<LayoutData | undefined>();
+  const sampleLayoutRef = useRef<LayoutData | undefined>();
+  sampleLayoutRef.current = selectedSource?.sampleLayout;
 
   useEffect(() => {
     if (selectedSource?.sampleLayout) {
+      restoreTokenRef.current = undefined;
       setCurrentLayout({ data: selectedSource.sampleLayout });
+      setHydrated(true);
     }
   }, [selectedSource, setCurrentLayout]);
 
   const [debouncedLayoutData] = useDebounce(currentLayoutData, 250, { maxWait: 500 });
 
   useEffect(() => {
-    if (!debouncedLayoutData) {
+    // Do not let the initial, transient layout overwrite a layout that is still loading from IDB.
+    // The identity check also waits for useDebounce to catch up after the restore changes the layout.
+    if (
+      !hydrated ||
+      !debouncedLayoutData ||
+      debouncedLayoutData !== currentLayoutData ||
+      debouncedLayoutData === persistedLayoutRef.current
+    ) {
       return;
     }
 
-    const serializedLayoutData = JSON.stringify(debouncedLayoutData);
-    assert(serializedLayoutData);
-    localStorage.setItem(LOCAL_STORAGE_STUDIO_LAYOUT_KEY, serializedLayoutData);
-  }, [debouncedLayoutData]);
+    // A rejected read does not prove that IndexedDB is empty. Avoid replaying exactly the
+    // fallback layout into it, but permit a later user edit to retry IndexedDB persistence.
+    if (debouncedLayoutData === layoutFromFailedReadRef.current) {
+      return;
+    }
+    layoutFromFailedReadRef.current = undefined;
+
+    void idbSet(LOCAL_STORAGE_STUDIO_LAYOUT_KEY, debouncedLayoutData, IDB_LAYOUT_STORE)
+      .then(() => {
+        persistedLayoutRef.current = debouncedLayoutData;
+        clearFallbackJournal();
+      })
+      .catch((error) => {
+        log.error(`Failed to persist layout to IndexedDB`, error);
+        if (writeFallbackJournal(debouncedLayoutData)) {
+          persistedLayoutRef.current = debouncedLayoutData;
+        }
+      });
+  }, [currentLayoutData, debouncedLayoutData, hydrated]);
 
   useEffect(() => {
-    log.debug(`Reading layout from local storage: ${LOCAL_STORAGE_STUDIO_LAYOUT_KEY}`);
+    const restoreToken = Symbol("layout restore");
+    restoreTokenRef.current = restoreToken;
 
-    const serializedLayoutData = localStorage.getItem(LOCAL_STORAGE_STUDIO_LAYOUT_KEY);
+    void (async () => {
+      let layoutData: LayoutData;
+      const fallbackJournalLayout = readFallbackJournal();
+      if (hasSampleLayout(sampleLayoutRef)) {
+        return;
+      }
+      try {
+        log.debug(`Reading layout from IndexedDB: ${LOCAL_STORAGE_STUDIO_LAYOUT_KEY}`);
+        const storedLayoutData = await idbGet<LayoutData>(
+          LOCAL_STORAGE_STUDIO_LAYOUT_KEY,
+          IDB_LAYOUT_STORE,
+        );
+        if (fallbackJournalLayout) {
+          layoutData = fallbackJournalLayout;
+          try {
+            await idbSet(LOCAL_STORAGE_STUDIO_LAYOUT_KEY, layoutData, IDB_LAYOUT_STORE);
+            persistedLayoutRef.current = layoutData;
+            clearFallbackJournal();
+          } catch (error) {
+            log.error(`Failed to reconcile IndexedDB fallback journal`, error);
+          }
+        } else if (storedLayoutData) {
+          layoutData = migratePanelsState(storedLayoutData);
+          // Normal migrations clone the layout. Keep the hydrated layout pending when its
+          // contents changed so the debounced writer stores the migrated representation once.
+          persistedLayoutRef.current = _.isEqual(storedLayoutData, layoutData)
+            ? layoutData
+            : undefined;
+        } else {
+          const legacyLayoutData = readLegacyLayout();
+          if (legacyLayoutData) {
+            try {
+              await idbSet(LOCAL_STORAGE_STUDIO_LAYOUT_KEY, legacyLayoutData, IDB_LAYOUT_STORE);
+              persistedLayoutRef.current = legacyLayoutData;
+              localStorage.removeItem(LOCAL_STORAGE_STUDIO_LAYOUT_KEY);
+            } catch (error) {
+              log.error(`Failed to migrate legacy layout to IndexedDB`, error);
+            }
+            layoutData = legacyLayoutData;
+          } else {
+            layoutData = migratePanelsState(defaultLayout);
+          }
+        }
+      } catch (error) {
+        log.error(`Failed to read layout from IndexedDB`, error);
+        // A read failure is not an empty database. Never use a fallback layout to overwrite
+        // IDB, which may contain newer data that becomes readable again later.
+        layoutData = fallbackJournalLayout ?? readLegacyLayout() ?? migratePanelsState(defaultLayout);
+        layoutFromFailedReadRef.current = layoutData;
+      }
 
-    if (serializedLayoutData) {
-      log.debug("Restoring layout from local storage");
-    } else {
-      log.debug("No layout found in local storage. Using default layout.");
-    }
+      if (restoreTokenRef.current !== restoreToken || hasSampleLayout(sampleLayoutRef)) {
+        return;
+      }
+      setCurrentLayout({ data: layoutData });
+      setHydrated(true);
+    })();
 
-    const layoutData = migratePanelsState(
-      serializedLayoutData ? (JSON.parse(serializedLayoutData) as LayoutData) : defaultLayout,
-    );
-    setCurrentLayout({ data: layoutData });
+    return () => {
+      if (restoreTokenRef.current === restoreToken) {
+        restoreTokenRef.current = undefined;
+      }
+    };
   }, [setCurrentLayout]);
 
   return <></>;
