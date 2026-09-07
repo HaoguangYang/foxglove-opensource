@@ -58,6 +58,13 @@ export const getBuiltin: (t: TFunction<"panels">) => PanelInfo[] = (t) => [
     module: async () => await import("./Image"),
   },
   {
+    title: "Video Tracks",
+    type: "VideoTracks",
+    description: "Align local videos with MCAP playback using a chosen frame or recording event.",
+    thumbnail: imageThumbnail,
+    module: async () => await import("./VideoTracks"),
+  },
+  {
     title: t("indicator"),
     type: "Indicator",
     description: t("indicatorDescription"),
