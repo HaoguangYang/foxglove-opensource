@@ -51,11 +51,11 @@ jobs:
 
       - uses: actions/setup-node@v4.0.1
         with:
-          node-version: 16.17
+          node-version: 20
       - run: corepack enable yarn
 
       - name: Restore cache
-        uses: actions/cache@v4.0.0
+        uses: actions/cache@v5.0.5
         with:
           path: |
             .yarn/cache
@@ -79,11 +79,11 @@ jobs:
 
       - uses: actions/setup-node@v4.0.1
         with:
-          node-version: 16.17
+          node-version: 20
       - run: corepack enable yarn
 
       - name: Restore cache
-        uses: actions/cache@v4.0.0
+        uses: actions/cache@v5.0.5
         with:
           path: |
             .yarn/cache
@@ -96,7 +96,7 @@ jobs:
       - run: yarn workspace @foxglove/studio-base run storybook:build
 
       # Chromatic only runs on pushes or pulls to our source repo
-      - uses: chromaui/action@v10
+      - uses: chromaui/action@v17
         if: ${{ github.event.repository.full_name == 'foxglove/studio' }}
         with:
           autoAcceptChanges: main
@@ -122,11 +122,11 @@ jobs:
 
       - uses: actions/setup-node@v4.0.1
         with:
-          node-version: 16.17
+          node-version: 20
       - run: corepack enable yarn
 
       - name: Restore cache
-        uses: actions/cache@v4.0.0
+        uses: actions/cache@v5.0.5
         with:
           path: |
             .yarn/cache
