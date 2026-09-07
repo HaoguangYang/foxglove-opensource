@@ -3,11 +3,17 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/
 
 import { Menu, PaperProps, PopoverPosition, PopoverReference } from "@mui/material";
+import { useSnackbar } from "notistack";
 import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { makeStyles } from "tss-react/mui";
 
 import TextMiddleTruncate from "@foxglove/studio-base/components/TextMiddleTruncate";
+import {
+  downloadLabels,
+  getTimelineLabelsStore,
+  useTimelineLabelsStore,
+} from "@foxglove/studio-base/components/TimelineLabels";
 import { usePlayerSelection } from "@foxglove/studio-base/context/PlayerSelectionContext";
 import {
   WorkspaceContextStore,
@@ -46,6 +52,8 @@ export function AppMenu(props: AppMenuProps): JSX.Element {
   const { t } = useTranslation("appBar");
 
   const [nestedMenu, setNestedMenu] = useState<string | undefined>();
+  const labels = useTimelineLabelsStore((state) => state.labels);
+  const { enqueueSnackbar } = useSnackbar();
 
   const { recentSources, selectRecent } = usePlayerSelection();
 
@@ -94,6 +102,23 @@ export function AppMenu(props: AppMenuProps): JSX.Element {
         },
       },
       { type: "divider" },
+      {
+        type: "item",
+        label: "Export labels",
+        key: "export-labels",
+        disabled: labels.length === 0,
+        onClick: () => {
+          const store = getTimelineLabelsStore();
+          // Refresh at export as well, so recent saves in another tab are included.
+          if (!store.getState().refresh()) {
+            enqueueSnackbar(store.getState().error, { variant: "error" });
+            return;
+          }
+          downloadLabels(store.getState().labels);
+          handleNestedMenuClose();
+        },
+      },
+      { type: "divider" },
       { type: "item", label: t("recentDataSources"), key: "recent-sources", disabled: true },
     ];
 
@@ -114,7 +139,9 @@ export function AppMenu(props: AppMenuProps): JSX.Element {
     classes.truncate,
     dialogActions.dataSource,
     dialogActions.openFile,
+    enqueueSnackbar,
     handleNestedMenuClose,
+    labels,
     recentSources,
     selectRecent,
     t,

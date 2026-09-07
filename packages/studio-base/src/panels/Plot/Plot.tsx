@@ -24,10 +24,6 @@ import {
   useMessagePipelineSubscribe,
 } from "@foxglove/studio-base/components/MessagePipeline";
 import { usePanelContext } from "@foxglove/studio-base/components/PanelContext";
-import {
-  PanelContextMenu,
-  PanelContextMenuItem,
-} from "@foxglove/studio-base/components/PanelContextMenu";
 import PanelToolbar, {
   PANEL_TOOLBAR_MIN_HEIGHT,
 } from "@foxglove/studio-base/components/PanelToolbar";
@@ -51,6 +47,7 @@ import { getLineColor } from "@foxglove/studio-base/util/plotColors";
 
 import { OffscreenCanvasRenderer } from "./OffscreenCanvasRenderer";
 import { PlotCoordinator } from "./PlotCoordinator";
+import { PlotLabels } from "./PlotLabels";
 import { PlotLegend } from "./PlotLegend";
 import { CurrentCustomDatasetsBuilder } from "./builders/CurrentCustomDatasetsBuilder";
 import { CustomDatasetsBuilder } from "./builders/CustomDatasetsBuilder";
@@ -208,23 +205,23 @@ export function Plot(props: Props): JSX.Element {
     [coordinator, getMessagePipelineState, xAxisMode],
   );
 
-  const getPanelContextMenuItems = useCallback(() => {
-    const items: PanelContextMenuItem[] = [
-      {
-        type: "item",
-        label: "Download plot data as CSV",
-        onclick: async () => {
-          const data = await coordinator?.getCsvData();
-          if (!data || !isMounted()) {
-            return;
-          }
+  const onDownloadCsv = useCallback(async () => {
+    const data = await coordinator?.getCsvData();
+    if (!data || !isMounted()) {
+      return;
+    }
 
-          downloadCSV(customTitle ?? "plot_data", data, xAxisMode);
-        },
-      },
-    ];
-    return items;
+    downloadCSV(customTitle ?? "plot_data", data, xAxisMode);
   }, [coordinator, customTitle, isMounted, xAxisMode]);
+
+  const labelSignalExpressions = useMemo(
+    () =>
+      series
+        .filter((path) => path.enabled && !isReferenceLinePlotPathType(path))
+        .map((path) => path.value),
+    [series],
+  );
+  const labelSignalMetadata = useMemo(() => series.filter((path) => path.enabled && !isReferenceLinePlotPathType(path)).map((path) => ({ expression: path.value, timestampMethod: path.timestampMethod })), [series]);
 
   const setSubscriptions = useMessagePipeline(
     useCallback(
@@ -490,8 +487,17 @@ export function Plot(props: Props): JSX.Element {
     const hammerManager = new Hammer.Manager(canvasDiv);
     const threshold = 10;
     hammerManager.add(new Hammer.Pan({ threshold }));
+    let isPanning = false;
 
     hammerManager.on("panstart", (event) => {
+      // Timestamp plots reserve ordinary left drag for labels. Shift+drag still pans.
+      isPanning =
+        xAxisMode !== "timestamp" ||
+        event.pointerType !== "mouse" ||
+        (event.srcEvent as MouseEvent).shiftKey;
+      if (!isPanning) {
+        return;
+      }
       draggingRef.current = true;
       const boundingRect = event.target.getBoundingClientRect();
       coordinator.addInteractionEvent({
@@ -508,6 +514,9 @@ export function Plot(props: Props): JSX.Element {
     });
 
     hammerManager.on("panmove", (event) => {
+      if (!isPanning) {
+        return;
+      }
       const boundingRect = event.target.getBoundingClientRect();
       coordinator.addInteractionEvent({
         type: "panmove",
@@ -519,6 +528,10 @@ export function Plot(props: Props): JSX.Element {
     });
 
     hammerManager.on("panend", (event) => {
+      if (!isPanning) {
+        return;
+      }
+      isPanning = false;
       const boundingRect = event.target.getBoundingClientRect();
       coordinator.addInteractionEvent({
         type: "panend",
@@ -538,7 +551,7 @@ export function Plot(props: Props): JSX.Element {
     return () => {
       hammerManager.destroy();
     };
-  }, [canvasDiv, coordinator]);
+  }, [canvasDiv, coordinator, xAxisMode]);
 
   // We could subscribe in the chart renderer, but doing it with react effects is easier for
   // managing the lifecycle of the subscriptions. The renderer will correlate input message data to
@@ -716,6 +729,8 @@ export function Plot(props: Props): JSX.Element {
           <div className={classes.verticalBarWrapper}>
             <div
               className={classes.canvasDiv}
+              tabIndex={0}
+              aria-label="Plot chart. Drag to select a time region, then right-click to add a label. Shift-drag to pan."
               ref={setCanvasDiv}
               onWheel={onWheel}
               onMouseMove={onMouseMove}
@@ -727,6 +742,16 @@ export function Plot(props: Props): JSX.Element {
               coordinator={coordinator}
               hoverComponentId={subscriberId}
               xAxisIsPlaybackTime={xAxisMode === "timestamp"}
+            />
+            <PlotLabels
+              canvas={canvasDiv}
+              coordinator={coordinator}
+              timestampAxis={xAxisMode === "timestamp"}
+              draggingRef={draggingRef}
+              signalExpressions={labelSignalExpressions}
+              signalMetadata={labelSignalMetadata}
+              originPanelId={subscriberId}
+              onDownloadCsv={onDownloadCsv}
             />
           </div>
         </Tooltip>
@@ -742,7 +767,6 @@ export function Plot(props: Props): JSX.Element {
             </Button>
           </div>
         )}
-        <PanelContextMenu getItems={getPanelContextMenuItems} />
       </Stack>
       <KeyListener global keyDownHandlers={keyDownHandlers} keyUpHandlers={keyUphandlers} />
     </Stack>

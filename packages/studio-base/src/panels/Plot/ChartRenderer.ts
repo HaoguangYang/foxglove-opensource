@@ -20,6 +20,8 @@ export type Scale = {
   max: number;
   left: number;
   right: number;
+  top: number;
+  bottom: number;
 };
 
 type BaseInteractionEvent = {
@@ -400,6 +402,8 @@ export class ChartRenderer {
       max: xScale.max,
       left: xScale.left,
       right: xScale.right,
+      top: this.#chartInstance.chartArea.top,
+      bottom: this.#chartInstance.chartArea.bottom,
     };
   }
 

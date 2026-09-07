@@ -335,6 +335,10 @@ export class PlotCoordinator extends EventEmitter<EventTypes> {
   }
 
   /** Get the plot x value at the canvas pixel x location */
+  public getXScale(): Scale | undefined {
+    return this.#latestXScale;
+  }
+
   public getXValueAtPixel(pixelX: number): number {
     if (!this.#latestXScale) {
       return -1;
